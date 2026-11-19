@@ -1,7 +1,6 @@
 streamlit
 pandas
+openpyxl
 google-genai
-openai
-anthropic
 gspread
-oauth2client
+google-auth
