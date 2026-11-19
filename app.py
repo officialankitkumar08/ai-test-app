@@ -61,6 +61,16 @@ st.markdown(
             font-size: 16px;
             display: inline-block;
         }
+        .paused-pill {
+            background: #422006;
+            border: 1px solid #f59e0b;
+            color: #fde68a;
+            padding: 8px 16px;
+            border-radius: 999px;
+            font-weight: 700;
+            font-size: 16px;
+            display: inline-block;
+        }
         .q-card {
             background: #1e293b;
             border: 1px solid #334155;
@@ -231,12 +241,13 @@ def load_tests_from_sheet(ss):
   ws = ensure_worksheet(ss, "Tests")
   rows = ws.get_all_values()
   tests = []
-  for r in rows[1:]:
+  for row_num, r in enumerate(rows[1:], start=2):
     if len(r) >= 5 and r[1].strip() and r[4].strip():
       try:
         qs = json.loads(r[4])
         if isinstance(qs, list) and qs:
           tests.append({
+              "row_num": row_num,
               "test_id": r[0].strip(),
               "test_name": r[1].strip(),
               "creator": r[2].strip() or "admin",
@@ -253,9 +264,43 @@ def add_test_to_sheet(ss, test_name, creator, questions):
   test_id = f"T-{uuid.uuid4().hex[:8].upper()}"
   created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
   ws.append_row(
-      [test_id, test_name, creator, created_at, json.dumps(questions, ensure_ascii=False)],
+      [
+          test_id,
+          test_name,
+          creator,
+          created_at,
+          json.dumps(questions, ensure_ascii=False),
+      ],
       value_input_option="RAW",
   )
+
+
+def rename_test_in_sheet(ss, test_obj, new_name):
+  ws = ensure_worksheet(ss, "Tests")
+  rows = ws.get_all_values()
+  tid = test_obj.get("test_id", "")
+  for idx in range(2, len(rows) + 1):
+    r = rows[idx - 1]
+    if (tid and len(r) >= 1 and r[0].strip() == tid) or (
+        len(r) >= 2 and r[1].strip() == test_obj.get("test_name", "")
+    ):
+      ws.update_cell(idx, 2, new_name.strip())
+      return True
+  return False
+
+
+def delete_test_from_sheet(ss, test_obj):
+  ws = ensure_worksheet(ss, "Tests")
+  rows = ws.get_all_values()
+  tid = test_obj.get("test_id", "")
+  for idx in range(len(rows), 1, -1):
+    r = rows[idx - 1]
+    if (tid and len(r) >= 1 and r[0].strip() == tid) or (
+        len(r) >= 2 and r[1].strip() == test_obj.get("test_name", "")
+    ):
+      ws.delete_rows(idx)
+      return True
+  return False
 
 
 def load_results_from_sheet(ss):
@@ -304,7 +349,6 @@ def add_result_to_sheet(ss, res_entry):
   )
 
 
-# Check Secrets Configuration
 try:
   spreadsheet = get_spreadsheet()
 except Exception as conn_err:
@@ -343,6 +387,12 @@ if "current_test" not in st.session_state:
   st.session_state.current_test = None
 if "test_active" not in st.session_state:
   st.session_state.test_active = False
+if "test_paused" not in st.session_state:
+  st.session_state.test_paused = False
+if "paused_at" not in st.session_state:
+  st.session_state.paused_at = None
+if "total_paused_sec" not in st.session_state:
+  st.session_state.total_paused_sec = 0.0
 if "q_index" not in st.session_state:
   st.session_state.q_index = 0
 if "q_last_tick" not in st.session_state:
@@ -366,13 +416,93 @@ def format_duration(seconds):
   return f"{secs}s"
 
 
+def get_active_elapsed():
+  if not st.session_state.test_active:
+    return 0.0
+  now = time.time()
+  paused_extra = 0.0
+  if st.session_state.test_paused and st.session_state.paused_at is not None:
+    paused_extra = max(0.0, now - st.session_state.paused_at)
+  return max(
+      0.0,
+      (now - st.session_state.get("start_time", now))
+      - st.session_state.get("total_paused_sec", 0.0)
+      - paused_extra,
+  )
+
+
 def record_current_q_time():
-  if st.session_state.test_active:
+  if st.session_state.test_active and not st.session_state.test_paused:
     now = time.time()
     spent = max(0.0, now - st.session_state.q_last_tick)
     idx = st.session_state.q_index
     st.session_state.q_times[idx] = st.session_state.q_times.get(idx, 0.0) + spent
     st.session_state.q_last_tick = now
+
+
+def pause_test_timer():
+  if st.session_state.test_active and not st.session_state.test_paused:
+    record_current_q_time()
+    st.session_state.test_paused = True
+    st.session_state.paused_at = time.time()
+
+
+def resume_test_timer():
+  if st.session_state.test_active and st.session_state.test_paused:
+    now = time.time()
+    if st.session_state.paused_at is not None:
+      st.session_state.total_paused_sec = st.session_state.get(
+          "total_paused_sec", 0.0
+      ) + max(0.0, now - st.session_state.paused_at)
+    st.session_state.paused_at = None
+    st.session_state.test_paused = False
+    st.session_state.q_last_tick = now
+
+
+def normalize_questions_df(df):
+  col_map = {c.strip().lower(): c for c in df.columns}
+  q_col = col_map.get("question") or col_map.get("q")
+  a_col = col_map.get("optiona") or col_map.get("a") or col_map.get("option 1")
+  b_col = col_map.get("optionb") or col_map.get("b") or col_map.get("option 2")
+  c_col = col_map.get("optionc") or col_map.get("c") or col_map.get("option 3")
+  d_col = col_map.get("optiond") or col_map.get("d") or col_map.get("option 4")
+  ans_col = (
+      col_map.get("answer") or col_map.get("ans") or col_map.get("correct")
+  )
+  exp_col = (
+      col_map.get("explanation")
+      or col_map.get("solution")
+      or col_map.get("hint")
+  )
+
+  if not all([q_col, a_col, b_col, c_col, d_col, ans_col]):
+    return []
+
+  questions = []
+  for _, row in df.iterrows():
+    q_txt = str(row[q_col]).strip()
+    if not q_txt or q_txt.lower() == "nan":
+      continue
+    opts = [
+        f"A) {str(row[a_col]).strip()}",
+        f"B) {str(row[b_col]).strip()}",
+        f"C) {str(row[c_col]).strip()}",
+        f"D) {str(row[d_col]).strip()}",
+    ]
+    ans_raw = str(row[ans_col]).strip().upper()
+    m_ans = re.search(r"[ABCD]", ans_raw)
+    ans_let = m_ans.group(0) if m_ans else "A"
+    exp_txt = ""
+    if exp_col and pd.notna(row[exp_col]):
+      exp_txt = str(row[exp_col]).strip()
+
+    questions.append({
+        "question": q_txt,
+        "options": opts,
+        "answer": ans_let,
+        "explanation": exp_txt,
+    })
+  return questions
 
 
 def parse_plain_questions(text):
@@ -387,7 +517,16 @@ def parse_plain_questions(text):
     ).strip()
     opts = []
     ans = "A"
+    exp = ""
     for ln in lines[1:]:
+      m_exp = re.match(
+          r"^(?:Explanation|Solution|Exp)\s*[:\-]\s*(.+)$",
+          ln,
+          flags=re.IGNORECASE,
+      )
+      if m_exp:
+        exp = m_exp.group(1).strip()
+        continue
       m_ans = re.match(
           r"^(?:Answer|Ans|Correct)\s*[:\-]\s*([A-Da-d])",
           ln,
@@ -398,14 +537,24 @@ def parse_plain_questions(text):
         continue
       m_opt = re.match(r"^([A-Da-d])[\)\.\:\-]\s*(.+)$", ln)
       if m_opt:
-        opts.append(m_opt.group(2).strip())
+        opts.append(f"{m_opt.group(1).upper()}) {m_opt.group(2).strip()}")
     if q_line and len(opts) >= 4:
       questions.append({
           "question": q_line,
           "options": opts[:4],
           "answer": ans,
+          "explanation": exp,
       })
   return questions
+
+
+def get_correct_option_text(d):
+  ans_let = str(d.get("correct", "")).strip().upper()
+  for opt in d.get("options", []):
+    s = str(opt).strip()
+    if re.match(rf"^{re.escape(ans_let)}[\)\.\:\-\s]", s, flags=re.IGNORECASE):
+      return s
+  return ans_let
 
 
 def build_doubt_prompt(q_num, d):
@@ -535,7 +684,7 @@ def render_test_analysis(result_obj, scope_prefix="res"):
   st.markdown(
       f"""
       <div class="hero-card">
-          <h3 style="margin:0 0 6px 0; color:#38bdf8;">Test Analysis: {safe_title}</h3>
+          <h3 style="margin:0 0 6px 0; color:#38bdf8;">Test Analysis & Answer Key: {safe_title}</h3>
           <div style="color:#cbd5e1; font-size:14px;">
               User: <b>{safe_user}</b> | Submitted: <b>{safe_ts}</b> | Total Time Taken: <b>{total_time_str}</b>
           </div>
@@ -564,13 +713,30 @@ def render_test_analysis(result_obj, scope_prefix="res"):
           unsafe_allow_html=True,
       )
 
-  st.markdown("### Question-by-Question Breakdown")
+  # Full Answer Key Summary Table
+  st.markdown("### Complete Answer Key Sheet")
+  key_rows = []
+  for idx, d in enumerate(result_obj["details"]):
+    key_rows.append({
+        "Q.No": idx + 1,
+        "Your Answer": d["user"],
+        "Correct Answer": d["correct"],
+        "Correct Option": get_correct_option_text(d),
+        "Status": d["status"],
+        "Time": format_duration(d.get("time_sec", 0)),
+    })
+  if key_rows:
+    st.dataframe(pd.DataFrame(key_rows), use_container_width=True, hide_index=True)
+
+  st.markdown("### Question-by-Question Breakdown & Solutions")
   for idx, d in enumerate(result_obj["details"]):
     q_time_str = format_duration(d.get("time_sec", 0))
     status = d["status"]
     safe_q = html.escape(str(d["question"]))
     safe_u = html.escape(str(d["user"]))
     safe_c = html.escape(str(d["correct"]))
+    safe_ans_opt = html.escape(get_correct_option_text(d))
+    exp_raw = str(d.get("explanation", "") or "").strip()
 
     if status == "Correct":
       box_cls = "review-right"
@@ -590,6 +756,12 @@ def render_test_analysis(result_obj, scope_prefix="res"):
         for o in d.get("options", [])
     ])
 
+    exp_html = (
+        f"<div style='margin-top:8px; padding:8px 12px; background:rgba(15,23,42,0.55); border-radius:8px; font-size:13px; color:#e2e8f0;'><b>Solution / Explanation:</b> {html.escape(exp_raw)}</div>"
+        if exp_raw
+        else ""
+    )
+
     st.markdown(
         f"""
         <div class="{box_cls}">
@@ -600,8 +772,9 @@ def render_test_analysis(result_obj, scope_prefix="res"):
             <div style="font-size:16px; font-weight:600; margin-bottom:8px;">Q{idx+1}. {safe_q}</div>
             {opts_html}
             <div style="margin-top:10px; font-size:14px;">
-                Your Answer: <b>{safe_u}</b> &nbsp;|&nbsp; Correct Answer: <b>{safe_c}</b>
+                Your Answer: <b>{safe_u}</b> &nbsp;|&nbsp; Answer Key: <b>{safe_c} ({safe_ans_opt})</b>
             </div>
+            {exp_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -613,14 +786,15 @@ def render_test_analysis(result_obj, scope_prefix="res"):
 
 def submit_test(test):
   record_current_q_time()
+  total_elapsed = get_active_elapsed()
   st.session_state.test_active = False
+  st.session_state.test_paused = False
+  st.session_state.paused_at = None
+  st.session_state.total_paused_sec = 0.0
 
   score = 0
   detailed = []
   questions = test["questions"]
-  total_elapsed = max(
-      0.0, time.time() - st.session_state.get("start_time", time.time())
-  )
 
   for i, q in enumerate(questions):
     u_ans = st.session_state.user_answers.get(i)
@@ -645,6 +819,7 @@ def submit_test(test):
         "user": u_display,
         "status": status,
         "time_sec": round(q_sec, 1),
+        "explanation": str(q.get("explanation", "") or "").strip(),
     })
 
   pct = round((score / len(questions)) * 100, 2) if len(questions) > 0 else 0.0
@@ -714,6 +889,8 @@ def auth_screen():
 if not st.session_state.logged_in:
   auth_screen()
 else:
+  is_admin = st.session_state.role == "admin"
+
   st.sidebar.markdown(
       f"""
       <div class="metric-card" style="border-left-color:#22c55e;">
@@ -735,9 +912,9 @@ else:
   menu = [
       "Take Test & Analysis",
       "Progress & Past Tests",
-      "Upload Questions (File / Text)",
   ]
-  if st.session_state.role == "admin":
+  if is_admin:
+    menu.append("Upload Questions (File / Text)")
     menu.append("Admin Dashboard (All Users)")
 
   choice = st.sidebar.radio("Navigation", menu)
@@ -751,6 +928,7 @@ else:
     st.session_state.username = ""
     st.session_state.role = ""
     st.session_state.test_active = False
+    st.session_state.test_paused = False
     st.session_state.latest_result = None
     st.rerun()
 
@@ -781,8 +959,8 @@ else:
 
       if not saved_tests:
         st.info(
-            "Abhi Google Sheet me koi test nahi hai. 'Upload Questions (File /"
-            " Text)' se upload karein!"
+            "Abhi koi test available nahi hai. Admin login se 'Upload Questions"
+            " (File / Text)' me test add karein."
         )
       else:
         for idx, t in enumerate(saved_tests):
@@ -812,6 +990,9 @@ else:
               now = time.time()
               st.session_state.current_test = t
               st.session_state.test_active = True
+              st.session_state.test_paused = False
+              st.session_state.paused_at = None
+              st.session_state.total_paused_sec = 0.0
               st.session_state.test_duration = t_mins * 60
               st.session_state.start_time = now
               st.session_state.q_last_tick = now
@@ -820,6 +1001,39 @@ else:
               st.session_state.user_answers = {}
               st.session_state.latest_result = None
               st.rerun()
+
+          if is_admin:
+            with st.expander(f"Admin: Rename / Delete '{t['test_name']}'"):
+              new_t_name = st.text_input(
+                  "New Test Name",
+                  value=t["test_name"],
+                  key=f"rename_inp_{idx}",
+              )
+              adm_c1, adm_c2 = st.columns(2)
+              with adm_c1:
+                if st.button(
+                    "Save Name", key=f"rename_btn_{idx}", use_container_width=True
+                ):
+                  if new_t_name.strip():
+                    if rename_test_in_sheet(spreadsheet, t, new_t_name):
+                      st.success("Test ka naam update ho gaya!")
+                      st.rerun()
+                    else:
+                      st.error("Sheet me test row nahi mili.")
+                  else:
+                    st.warning("Khali naam save nahi ho sakta.")
+              with adm_c2:
+                if st.button(
+                    "Delete Test",
+                    key=f"del_test_btn_{idx}",
+                    use_container_width=True,
+                ):
+                  if delete_test_from_sheet(spreadsheet, t):
+                    st.success("Test delete ho gaya!")
+                    st.rerun()
+                  else:
+                    st.error("Test delete nahi ho saka.")
+
           st.divider()
 
     else:
@@ -827,271 +1041,318 @@ else:
       questions = test["questions"]
       total_q = len(questions)
 
-      elapsed = time.time() - st.session_state.start_time
+      elapsed = get_active_elapsed()
       remaining = int(st.session_state.test_duration - elapsed)
 
-      if remaining <= 0:
+      if remaining <= 0 and not st.session_state.test_paused:
         submit_test(test)
       else:
-        m, s = divmod(remaining, 60)
-        top_l, top_r = st.columns([3, 1])
+        m, s = divmod(max(0, remaining), 60)
+        top_l, top_m, top_r = st.columns([2.5, 1, 1.2])
         with top_l:
           st.markdown(f"### {test['test_name']}")
           st.progress((st.session_state.q_index + 1) / total_q)
+        with top_m:
+          st.write("")
+          if st.session_state.test_paused:
+            if st.button("Resume Test", use_container_width=True):
+              resume_test_timer()
+              st.rerun()
+          else:
+            if st.button("Pause Test", use_container_width=True):
+              pause_test_timer()
+              st.rerun()
         with top_r:
+          if st.session_state.test_paused:
+            st.markdown(
+                f'<div class="paused-pill">PAUSED ({m:02d}:{s:02d})</div>',
+                unsafe_allow_html=True,
+            )
+          else:
+            st.markdown(
+                f'<div class="timer-pill">Time Left: {m:02d}:{s:02d}</div>',
+                unsafe_allow_html=True,
+            )
+
+        if st.session_state.test_paused:
+          st.info(
+              "Test abhi **PAUSED** hai — timer ruka hua hai. Aage badhne ke"
+              " liye **Resume Test** dabayein."
+          )
+        else:
+          st.caption("Question Palette:")
+          pal_cols = st.columns(min(10, total_q))
+          for p_i in range(total_q):
+            with pal_cols[p_i % len(pal_cols)]:
+              mark = "*" if p_i in st.session_state.user_answers else ""
+              if st.button(f"{p_i+1}{mark}", key=f"pal_{p_i}"):
+                record_current_q_time()
+                st.session_state.q_index = p_i
+                st.rerun()
+
+          cur_i = st.session_state.q_index
+          q = questions[cur_i]
+          cur_spent = st.session_state.q_times.get(cur_i, 0.0) + max(
+              0.0, time.time() - st.session_state.q_last_tick
+          )
+
+          saved_letter = st.session_state.user_answers.get(cur_i)
+          letters = ["A", "B", "C", "D"]
+          default_idx = (
+              letters.index(saved_letter) if saved_letter in letters else None
+          )
+
           st.markdown(
-              f'<div class="timer-pill">Time Left: {m:02d}:{s:02d}</div>',
+              f"""
+              <div class="q-card">
+                  <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                      <span style="color:#38bdf8; font-weight:700;">Question {cur_i+1} of {total_q}</span>
+                      <span style="color:#94a3b8; font-size:13px;">This Question Time: <b>{format_duration(cur_spent)}</b></span>
+                  </div>
+                  <div style="font-size:18px; font-weight:600; line-height:1.5;">{html.escape(str(q['question']))}</div>
+              </div>
+              """,
               unsafe_allow_html=True,
           )
 
-        st.caption("Question Palette:")
-        pal_cols = st.columns(min(10, total_q))
-        for p_i in range(total_q):
-          with pal_cols[p_i % len(pal_cols)]:
-            mark = "*" if p_i in st.session_state.user_answers else ""
-            if st.button(f"{p_i+1}{mark}", key=f"pal_{p_i}"):
+          choice_opt = st.radio(
+              "Apna option chunein:",
+              q["options"],
+              key=f"radio_q_{cur_i}",
+              index=default_idx,
+          )
+          if choice_opt is not None:
+            opt_idx = q["options"].index(choice_opt)
+            if opt_idx < len(letters):
+              st.session_state.user_answers[cur_i] = letters[opt_idx]
+
+          nav1, nav2, nav3, nav4 = st.columns(4)
+          with nav1:
+            if st.button(
+                "Previous", disabled=(cur_i == 0), use_container_width=True
+            ):
               record_current_q_time()
-              st.session_state.q_index = p_i
+              st.session_state.q_index = max(0, cur_i - 1)
               st.rerun()
-
-        cur_i = st.session_state.q_index
-        q = questions[cur_i]
-        cur_spent = st.session_state.q_times.get(cur_i, 0.0) + max(
-            0.0, time.time() - st.session_state.q_last_tick
-        )
-
-        saved_letter = st.session_state.user_answers.get(cur_i)
-        letters = ["A", "B", "C", "D"]
-        default_idx = (
-            letters.index(saved_letter) if saved_letter in letters else None
-        )
-
-        st.markdown(
-            f"""
-            <div class="q-card">
-                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                    <span style="color:#38bdf8; font-weight:700;">Question {cur_i+1} of {total_q}</span>
-                    <span style="color:#94a3b8; font-size:13px;">This Question Time: <b>{format_duration(cur_spent)}</b></span>
-                </div>
-                <div style="font-size:18px; font-weight:600; line-height:1.5;">{html.escape(str(q['question']))}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        choice_opt = st.radio(
-            "Apna option chunein:",
-            q["options"],
-            key=f"radio_q_{cur_i}",
-            index=default_idx,
-        )
-        if choice_opt is not None:
-          opt_idx = q["options"].index(choice_opt)
-          if opt_idx < len(letters):
-            st.session_state.user_answers[cur_i] = letters[opt_idx]
-
-        nav1, nav2, nav3, nav4 = st.columns(4)
-        with nav1:
-          if st.button(
-              "Previous", disabled=(cur_i == 0), use_container_width=True
-          ):
-            record_current_q_time()
-            st.session_state.q_index = max(0, cur_i - 1)
-            st.rerun()
-        with nav2:
-          if st.button("Clear Selection", use_container_width=True):
-            st.session_state.user_answers.pop(cur_i, None)
-            st.rerun()
-        with nav3:
-          if st.button(
-              "Next Question",
-              disabled=(cur_i >= total_q - 1),
-              use_container_width=True,
-          ):
-            record_current_q_time()
-            st.session_state.q_index = min(total_q - 1, cur_i + 1)
-            st.rerun()
-        with nav4:
-          if st.button("Submit Test", use_container_width=True):
-            submit_test(test)
+          with nav2:
+            if st.button("Clear Selection", use_container_width=True):
+              st.session_state.user_answers.pop(cur_i, None)
+              st.rerun()
+          with nav3:
+            if st.button(
+                "Next Question",
+                disabled=(cur_i >= total_q - 1),
+                use_container_width=True,
+            ):
+              record_current_q_time()
+              st.session_state.q_index = min(total_q - 1, cur_i + 1)
+              st.rerun()
+          with nav4:
+            if st.button(
+                "Submit Test", type="primary", use_container_width=True
+            ):
+              submit_test(test)
 
   # ---------------- 2. PROGRESS & PAST TESTS ----------------
   elif choice == "Progress & Past Tests":
     st.markdown(
         """
         <div class="hero-card">
-            <h2 style="margin:0; color:#38bdf8;">My Progress & Previous Tests</h2>
-            <p style="color:#94a3b8; margin:4px 0 0 0;">Google Sheet se aapki overall progress, accuracy trend aur pichle tests ka poora record</p>
+            <h2 style="margin:0; color:#38bdf8;">My Progress & Past Test History</h2>
+            <p style="color:#94a3b8; margin:4px 0 0 0;">Har attempt ka score, accuracy, time aur complete answer key yahan saved hai.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    my_res = [
+
+    my_results = [
         r for r in saved_results if r["username"] == st.session_state.username
     ]
-    if not my_res:
+
+    if not my_results:
       st.info("Aapne abhi tak koi test submit nahi kiya hai.")
     else:
-      render_progress_summary(my_res)
+      render_progress_summary(my_results)
 
-      df_my = pd.DataFrame([
+      st.markdown("#### Past Attempts Summary")
+      hist_df = pd.DataFrame([
           {
-              "Date/Time": r["timestamp"],
+              "Attempt": i + 1,
+              "Date & Time": r["timestamp"],
               "Test Name": r["test_name"],
               "Score": r["score"],
-              "Accuracy": f"{r['percentage']}%",
+              "Accuracy (%)": r["percentage"],
               "Time Taken": format_duration(r.get("total_time_sec", 0)),
           }
-          for r in my_res
+          for i, r in enumerate(my_results)
       ])
-      st.dataframe(df_my, use_container_width=True)
+      st.dataframe(hist_df, use_container_width=True, hide_index=True)
 
-      st.markdown("### Previous Test Attempts")
-      for idx, r in enumerate(reversed(my_res)):
-        att_num = len(my_res) - idx
-        with st.expander(
-            f"Attempt #{att_num}: {r['test_name']} | Score: {r['score']} ({r['percentage']}%) | Time: {format_duration(r.get('total_time_sec', 0))}"
-        ):
-          render_test_analysis(r, scope_prefix=f"prog_{att_num}")
+      st.markdown("#### Inspect Any Past Attempt (Answer Key & Solutions)")
+      labels = [
+          f"#{i+1} | {r['test_name']} | {r['score']} ({r['percentage']}%) | {r['timestamp']}"
+          for i, r in enumerate(my_results)
+      ]
+      sel_idx = st.selectbox(
+          "Attempt chunein:",
+          range(len(labels)),
+          format_func=lambda i: labels[i],
+      )
+      render_test_analysis(my_results[sel_idx], scope_prefix=f"hist_{sel_idx}")
 
-  # ---------------- 3. UPLOAD QUESTIONS (FILE / TEXT) ----------------
+  # ---------------- 3. UPLOAD QUESTIONS (ADMIN ONLY) ----------------
   elif choice == "Upload Questions (File / Text)":
+    if not is_admin:
+      st.error("Access Denied: Sirf Admin questions upload kar sakta hai.")
+      st.stop()
+
     st.markdown(
         """
         <div class="hero-card">
-            <h2 style="margin:0; color:#38bdf8;">Upload Questions (Excel / CSV / Text)</h2>
-            <p style="color:#94a3b8; margin:4px 0 0 0;">Upload kiye hue tests Google Sheet me save honge aur sabhi users ko dikhenge</p>
+            <h2 style="margin:0; color:#38bdf8;">Upload Practice Test Questions</h2>
+            <p style="color:#94a3b8; margin:4px 0 0 0;">Excel / CSV / JSON file upload karein ya plain text paste karke test publish karein.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    test_title = st.text_input("Test ka Naam", "Station Master Arithmetic Set")
 
-    tab_excel, tab_text = st.tabs(["Excel / CSV Upload", "Text / TXT Paste"])
+    test_title = st.text_input(
+        "Test Name / Title", placeholder="e.g. Station Master Latest 2D Set 1"
+    ).strip()
 
-    with tab_excel:
-      st.write(
-          "Columns rakhein: `Question`, `OptionA`, `OptionB`, `OptionC`,"
-          " `OptionD`, `Answer` (A/B/C/D)"
+    up_tab1, up_tab2 = st.tabs(
+        ["Excel / CSV / JSON File Upload", "Paste Questions Text"]
+    )
+
+    with up_tab1:
+      st.caption(
+          "Columns: Question, OptionA, OptionB, OptionC, OptionD, Answer"
+          " (Optional: Explanation)"
       )
-      up_file = st.file_uploader(
-          "Excel (.xlsx) ya CSV (.csv) chunein", type=["xlsx", "csv"]
+      uploaded_file = st.file_uploader(
+          "File chunein (.xlsx, .xls, .csv, .json)",
+          type=["xlsx", "xls", "csv", "json"],
       )
-      if up_file is not None:
-        df = (
-            pd.read_csv(up_file)
-            if up_file.name.endswith(".csv")
-            else pd.read_excel(up_file)
-        )
-        st.dataframe(df.head(), use_container_width=True)
-
-        if st.button("Excel se Test Publish Karein"):
-          questions = []
-          for _, row in df.iterrows():
-            q_text = str(row.get("Question", "")).strip()
-            if q_text and q_text.lower() != "nan":
-              questions.append({
-                  "question": q_text,
-                  "options": [
-                      str(row.get("OptionA", "")).strip(),
-                      str(row.get("OptionB", "")).strip(),
-                      str(row.get("OptionC", "")).strip(),
-                      str(row.get("OptionD", "")).strip(),
-                  ],
-                  "answer": str(row.get("Answer", "A")).strip().upper(),
-              })
-          if questions:
-            add_test_to_sheet(
-                spreadsheet, test_title, st.session_state.username, questions
-            )
-            st.success(
-                f"{len(questions)} questions Google Sheet me save aur publish ho gaye!"
-            )
+      if uploaded_file is not None:
+        try:
+          if uploaded_file.name.lower().endswith(".csv"):
+            df_q = pd.read_csv(uploaded_file)
+            parsed_q = normalize_questions_df(df_q)
+          elif uploaded_file.name.lower().endswith((".xlsx", ".xls")):
+            df_q = pd.read_excel(uploaded_file)
+            parsed_q = normalize_questions_df(df_q)
           else:
-            st.error("Valid questions nahi mile. Column names check karein.")
+            raw_json = json.load(uploaded_file)
+            parsed_q = raw_json if isinstance(raw_json, list) else []
 
-    with tab_text:
-      st.write(
-          "Har question block ke baad ek blank line rakhein, options A)/B)/C)/D)"
-          " me likhein, aur `Answer: A` likhein."
+          st.success(f"{len(parsed_q)} valid questions mile.")
+          if st.button("Publish File Test to Google Sheet", type="primary"):
+            final_name = (
+                test_title
+                or uploaded_file.name.rsplit(".", 1)[0]
+                or "Uploaded Test"
+            )
+            if not parsed_q:
+              st.error("File me valid questions nahi mile.")
+            else:
+              add_test_to_sheet(
+                  spreadsheet, final_name, st.session_state.username, parsed_q
+              )
+              st.success(
+                  f"Test '{final_name}' ({len(parsed_q)} questions) publish ho"
+                  " gaya!"
+              )
+              st.rerun()
+        except Exception as e:
+          st.error(f"File read error: {e}")
+
+    with up_tab2:
+      sample_txt = (
+          "Q1. भारत की राजधानी क्या है?\n"
+          "A) मुंबई\n"
+          "B) नई दिल्ली\n"
+          "C) कोलकाता\n"
+          "D) चेन्नई\n"
+          "Answer: B\n"
+          "Explanation: नई दिल्ली भारत की राजधानी है।\n\n"
+          "Q2. 15 * 6 का मान क्या है?\n"
+          "A) 75\n"
+          "B) 80\n"
+          "C) 90\n"
+          "D) 95\n"
+          "Answer: C\n"
+          "Explanation: 15 × 6 = 90।"
       )
-      txt_upload = st.file_uploader("Ya .txt file upload karein", type=["txt"])
-      default_txt = ""
-      if txt_upload is not None:
-        default_txt = txt_upload.read().decode("utf-8", errors="ignore")
-
       raw_text = st.text_area(
-          "Questions + Options + Answer paste karein:",
-          value=default_txt,
-          height=200,
-          placeholder=(
-              "Q1. 25% of 200 is?\nA) 25\nB) 50\nC) 75\nD) 100\nAnswer: B\n\n"
-              "Q2. 12 * 15 = ?\nA) 150\nB) 160\nC) 180\nD) 200\nAnswer: C"
-          ),
+          "Questions paste karein:", value=sample_txt, height=240
       )
-
-      if st.button("Text se Test Publish Karein"):
-        parsed_qs = parse_plain_questions(raw_text)
-        if parsed_qs:
-          add_test_to_sheet(
-              spreadsheet, test_title, st.session_state.username, parsed_qs
-          )
-          st.success(
-              f"{len(parsed_qs)} questions Google Sheet me save aur publish ho gaye!"
+      if st.button("Parse & Publish Text Test", type="primary"):
+        qs = parse_plain_questions(raw_text)
+        if not test_title:
+          st.warning("Kripya Test Name likhein.")
+        elif not qs:
+          st.error(
+              "Format check karein: har question ke baad 4 options aur Answer:"
+              " A/B/C/D hona chahiye."
           )
         else:
-          st.error(
-              "Format match nahi hua. Har sawal me 4 options (A/B/C/D) aur"
-              " Answer: A/B/C/D rakhein."
+          add_test_to_sheet(
+              spreadsheet, test_title, st.session_state.username, qs
           )
+          st.success(
+              f"Test '{test_title}' ({len(qs)} questions) Google Sheet me save"
+              " ho gaya!"
+          )
+          st.rerun()
 
-  # ---------------- 4. ADMIN DASHBOARD (ALL USERS) ----------------
-  elif (
-      choice == "Admin Dashboard (All Users)"
-      and st.session_state.role == "admin"
-  ):
+  # ---------------- 4. ADMIN DASHBOARD (ADMIN ONLY) ----------------
+  elif choice == "Admin Dashboard (All Users)":
+    if not is_admin:
+      st.error("Access Denied: Sirf Admin is page ko dekh sakta hai.")
+      st.stop()
+
     st.markdown(
         """
         <div class="hero-card">
-            <h2 style="margin:0; color:#38bdf8;">Admin Dashboard - All Users Performance</h2>
-            <p style="color:#94a3b8; margin:4px 0 0 0;">Sabhi users ke attempts, scores, time taken aur detailed question analysis</p>
+            <h2 style="margin:0; color:#38bdf8;">Admin Overview — All Users & Attempts</h2>
+            <p style="color:#94a3b8; margin:4px 0 0 0;">Google Sheet me saved sabhi tests, users aur test attempts ka record.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    users_dict = load_users_from_sheet(spreadsheet)
-    with st.expander("Manage Users (Google Sheet Users List)"):
-      st.dataframe(
-          pd.DataFrame([
-              {"Username": u, "Role": info["role"]}
-              for u, info in users_dict.items()
-          ]),
-          use_container_width=True,
-      )
+    users_map = load_users_from_sheet(spreadsheet)
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Total Users", len(users_map))
+    a2.metric("Total Published Tests", len(saved_tests))
+    a3.metric("Total Attempts", len(saved_results))
+
+    st.markdown("#### Published Tests Management")
+    if saved_tests:
+      t_df = pd.DataFrame([
+          {
+              "Test ID": t.get("test_id", ""),
+              "Test Name": t["test_name"],
+              "Questions": len(t["questions"]),
+              "Created By": t["creator"],
+              "Created At": t.get("created_at", ""),
+          }
+          for t in saved_tests
+      ])
+      st.dataframe(t_df, use_container_width=True, hide_index=True)
 
     if not saved_results:
-      st.info("Abhi tak kisi bhi user ne test nahi diya hai.")
+      st.info("Abhi tak kisi user ne test submit nahi kiya hai.")
     else:
-      render_progress_summary(saved_results)
-
-      df_res = pd.DataFrame([
+      all_df = pd.DataFrame([
           {
-              "Time": r["timestamp"],
-              "User": r["username"],
+              "Date & Time": r["timestamp"],
+              "Username": r["username"],
               "Test Name": r["test_name"],
               "Score": r["score"],
-              "Accuracy": f"{r['percentage']}%",
-              "Total Time": format_duration(r.get("total_time_sec", 0)),
+              "Accuracy (%)": r["percentage"],
+              "Time Taken": format_duration(r.get("total_time_sec", 0)),
           }
           for r in saved_results
       ])
-      st.dataframe(df_res, use_container_width=True)
-
-      st.markdown("### Detailed User Analysis")
-      for idx, res in enumerate(reversed(saved_results)):
-        rec_num = len(saved_results) - idx
-        with st.expander(
-            f"#{rec_num} | User: {res['username']} | Test: {res['test_name']} | Score: {res['score']} | Time: {format_duration(res.get('total_time_sec', 0))}"
-        ):
-          render_test_analysis(res, scope_prefix=f"adm_{rec_num}")
+      st.dataframe(all_df, use_container_width=True, hide_index=True)
