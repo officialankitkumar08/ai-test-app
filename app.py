@@ -226,7 +226,9 @@ You must return ONLY a valid JSON array of objects. Do not include markdown ```j
             if ai_provider == "Google Gemini":
               client = genai.Client(api_key=api_key)
               response = client.models.generate_content(
-                  model="gemini-2.5-flash", contents=structured_prompt
+                  model="gemini-3.8-flash",
+                  contents=structured_prompt,
+                  config={"max_output_tokens": 8192},
               )
               raw = (
                   response.text.replace("```json", "")
