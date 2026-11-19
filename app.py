@@ -1,3 +1,4 @@
+import hashlib
 import html
 import json
 import re
@@ -162,6 +163,19 @@ TAB_HEADERS = {
         "DetailsJSON",
     ],
     "Sessions": ["SessionID", "Username", "CreatedAt"],
+    "ActiveAttempts": [
+        "AttemptKey",
+        "Username",
+        "TestID",
+        "TestName",
+        "RemainingSec",
+        "TotalDurationSec",
+        "IsPaused",
+        "QIndex",
+        "AnswersJSON",
+        "QTimesJSON",
+        "UpdatedAt",
+    ],
 }
 
 
@@ -177,18 +191,27 @@ def get_spreadsheet():
 
 
 def ensure_worksheet(ss, title):
+  cache_key = f"_ws_ready_{title}"
+  if st.session_state.get(cache_key):
+    try:
+      return ss.worksheet(title)
+    except Exception:
+      st.session_state[cache_key] = False
   try:
     ws = ss.worksheet(title)
   except gspread.WorksheetNotFound:
-    ws = ss.add_worksheet(title=title, rows=1000, cols=10)
+    ws = ss.add_worksheet(title=title, rows=1000, cols=12)
   headers = TAB_HEADERS[title]
   first_row = ws.row_values(1)
   if first_row != headers:
     ws.update("A1", [headers])
+  st.session_state[cache_key] = True
   return ws
 
 
-def load_users_from_sheet(ss):
+def load_users_from_sheet(ss, force=False):
+  if not force and "cache_users" in st.session_state:
+    return st.session_state["cache_users"]
   ws = ensure_worksheet(ss, "Users")
   rows = ws.get_all_values()
   users = {}
@@ -201,12 +224,16 @@ def load_users_from_sheet(ss):
   if not users:
     ws.append_row(["admin", "123", "admin"], value_input_option="RAW")
     users["admin"] = {"password": "123", "role": "admin"}
+  st.session_state["cache_users"] = users
   return users
 
 
 def add_user_to_sheet(ss, username, password, role="student"):
   ws = ensure_worksheet(ss, "Users")
   ws.append_row([username, password, role], value_input_option="RAW")
+  users = load_users_from_sheet(ss)
+  users[username] = {"password": password, "role": role}
+  st.session_state["cache_users"] = users
 
 
 def save_session_to_sheet(ss, sid, username):
@@ -237,7 +264,9 @@ def delete_session_from_sheet(ss, sid):
       break
 
 
-def load_tests_from_sheet(ss):
+def load_tests_from_sheet(ss, force=False):
+  if not force and "cache_tests" in st.session_state:
+    return st.session_state["cache_tests"]
   ws = ensure_worksheet(ss, "Tests")
   rows = ws.get_all_values()
   tests = []
@@ -246,9 +275,10 @@ def load_tests_from_sheet(ss):
       try:
         qs = json.loads(r[4])
         if isinstance(qs, list) and qs:
+          tid = r[0].strip() or hashlib.md5(r[1].strip().encode()).hexdigest()[:8].upper()
           tests.append({
               "row_num": row_num,
-              "test_id": r[0].strip(),
+              "test_id": tid,
               "test_name": r[1].strip(),
               "creator": r[2].strip() or "admin",
               "created_at": r[3].strip(),
@@ -256,6 +286,7 @@ def load_tests_from_sheet(ss):
           })
       except Exception:
         continue
+  st.session_state["cache_tests"] = tests
   return tests
 
 
@@ -273,6 +304,7 @@ def add_test_to_sheet(ss, test_name, creator, questions):
       ],
       value_input_option="RAW",
   )
+  load_tests_from_sheet(ss, force=True)
 
 
 def rename_test_in_sheet(ss, test_obj, new_name):
@@ -285,6 +317,7 @@ def rename_test_in_sheet(ss, test_obj, new_name):
         len(r) >= 2 and r[1].strip() == test_obj.get("test_name", "")
     ):
       ws.update_cell(idx, 2, new_name.strip())
+      load_tests_from_sheet(ss, force=True)
       return True
   return False
 
@@ -299,11 +332,14 @@ def delete_test_from_sheet(ss, test_obj):
         len(r) >= 2 and r[1].strip() == test_obj.get("test_name", "")
     ):
       ws.delete_rows(idx)
+      load_tests_from_sheet(ss, force=True)
       return True
   return False
 
 
-def load_results_from_sheet(ss):
+def load_results_from_sheet(ss, force=False):
+  if not force and "cache_results" in st.session_state:
+    return st.session_state["cache_results"]
   ws = ensure_worksheet(ss, "Results")
   rows = ws.get_all_values()
   results = []
@@ -330,6 +366,7 @@ def load_results_from_sheet(ss):
           "total_time_sec": t_sec,
           "details": details,
       })
+  st.session_state["cache_results"] = results
   return results
 
 
@@ -347,6 +384,119 @@ def add_result_to_sheet(ss, res_entry):
       ],
       value_input_option="RAW",
   )
+  res_cache = load_results_from_sheet(ss)
+  res_cache.append(res_entry)
+  st.session_state["cache_results"] = res_cache
+
+
+def make_attempt_key(username, test_obj):
+  tid = test_obj.get("test_id") or hashlib.md5(
+      test_obj.get("test_name", "").encode()
+  ).hexdigest()[:8].upper()
+  return f"{username}__{tid}"
+
+
+def load_active_attempts_from_sheet(ss, force=False):
+  if not force and "cache_active_attempts" in st.session_state:
+    return st.session_state["cache_active_attempts"]
+  ws = ensure_worksheet(ss, "ActiveAttempts")
+  rows = ws.get_all_values()
+  attempts = {}
+  for r in rows[1:]:
+    if len(r) >= 11 and r[0].strip():
+      akey = r[0].strip()
+      try:
+        rem_sec = float(r[4])
+      except Exception:
+        rem_sec = 300.0
+      try:
+        tot_dur = float(r[5])
+      except Exception:
+        tot_dur = max(300.0, rem_sec)
+      is_paused = str(r[6]).strip().lower() == "true"
+      try:
+        q_idx = int(float(r[7]))
+      except Exception:
+        q_idx = 0
+      try:
+        ans_map = json.loads(r[8]) if r[8].strip() else {}
+        ans_map = {int(k): v for k, v in ans_map.items()}
+      except Exception:
+        ans_map = {}
+      try:
+        qt_map = json.loads(r[9]) if r[9].strip() else {}
+        qt_map = {int(k): float(v) for k, v in qt_map.items()}
+      except Exception:
+        qt_map = {}
+      attempts[akey] = {
+          "attempt_key": akey,
+          "username": r[1].strip(),
+          "test_id": r[2].strip(),
+          "test_name": r[3].strip(),
+          "remaining_sec": max(0.0, rem_sec),
+          "total_duration_sec": max(1.0, tot_dur),
+          "is_paused": is_paused,
+          "q_index": max(0, q_idx),
+          "user_answers": ans_map,
+          "q_times": qt_map,
+          "updated_at": r[10].strip(),
+      }
+  st.session_state["cache_active_attempts"] = attempts
+  return attempts
+
+
+def save_active_attempt_to_sheet(ss, attempt_obj):
+  ws = ensure_worksheet(ss, "ActiveAttempts")
+  akey = attempt_obj["attempt_key"]
+  ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  row_vals = [
+      akey,
+      attempt_obj["username"],
+      attempt_obj["test_id"],
+      attempt_obj["test_name"],
+      str(round(max(0.0, attempt_obj["remaining_sec"]), 2)),
+      str(round(max(1.0, attempt_obj["total_duration_sec"]), 2)),
+      "TRUE" if attempt_obj["is_paused"] else "FALSE",
+      str(attempt_obj["q_index"]),
+      json.dumps(
+          {str(k): v for k, v in attempt_obj["user_answers"].items()},
+          ensure_ascii=False,
+      ),
+      json.dumps(
+          {str(k): round(float(v), 2) for k, v in attempt_obj["q_times"].items()},
+          ensure_ascii=False,
+      ),
+      ts,
+  ]
+  rows = ws.get_all_values()
+  found_row = None
+  for idx in range(2, len(rows) + 1):
+    if len(rows[idx - 1]) >= 1 and rows[idx - 1][0].strip() == akey:
+      found_row = idx
+      break
+  if found_row:
+    ws.update(f"A{found_row}:K{found_row}", [row_vals], value_input_option="RAW")
+  else:
+    ws.append_row(row_vals, value_input_option="RAW")
+
+  attempts = load_active_attempts_from_sheet(ss)
+  attempt_obj["updated_at"] = ts
+  attempts[akey] = attempt_obj
+  st.session_state["cache_active_attempts"] = attempts
+
+
+def delete_active_attempt_from_sheet(ss, akey):
+  if not akey:
+    return
+  ws = ensure_worksheet(ss, "ActiveAttempts")
+  rows = ws.get_all_values()
+  for idx in range(len(rows), 1, -1):
+    if len(rows[idx - 1]) >= 1 and rows[idx - 1][0].strip() == akey:
+      ws.delete_rows(idx)
+      break
+  attempts = load_active_attempts_from_sheet(ss)
+  attempts.pop(akey, None)
+  st.session_state["cache_active_attempts"] = attempts
 
 
 try:
@@ -362,7 +512,7 @@ if spreadsheet is None:
   )
   st.stop()
 
-# ================= REFRESH-SAFE SESSION RESTORE =================
+# ================= REFRESH-SAFE SESSION & STATE RESTORE =================
 query_sid = st.query_params.get("sid")
 if "logged_in" not in st.session_state:
   st.session_state.logged_in = False
@@ -389,14 +539,14 @@ if "test_active" not in st.session_state:
   st.session_state.test_active = False
 if "test_paused" not in st.session_state:
   st.session_state.test_paused = False
-if "paused_at" not in st.session_state:
-  st.session_state.paused_at = None
-if "total_paused_sec" not in st.session_state:
-  st.session_state.total_paused_sec = 0.0
+if "remaining_sec" not in st.session_state:
+  st.session_state.remaining_sec = 0.0
+if "test_duration_sec" not in st.session_state:
+  st.session_state.test_duration_sec = 0.0
+if "last_active_ts" not in st.session_state:
+  st.session_state.last_active_ts = time.time()
 if "q_index" not in st.session_state:
   st.session_state.q_index = 0
-if "q_last_tick" not in st.session_state:
-  st.session_state.q_last_tick = time.time()
 if "q_times" not in st.session_state:
   st.session_state.q_times = {}
 if "user_answers" not in st.session_state:
@@ -407,7 +557,7 @@ if "doubt_explanations" not in st.session_state:
   st.session_state.doubt_explanations = {}
 
 
-# ================= HELPER FUNCTIONS =================
+# ================= TIMER & AUTO-SAVE HELPERS =================
 def format_duration(seconds):
   seconds = max(0, int(round(seconds)))
   mins, secs = divmod(seconds, 60)
@@ -416,49 +566,90 @@ def format_duration(seconds):
   return f"{secs}s"
 
 
-def get_active_elapsed():
-  if not st.session_state.test_active:
-    return 0.0
+def sync_timer_and_question_clock(count_elapsed=True):
+  """Syncs remaining_sec and current question time cleanly without leaking pause/rerun lag."""
   now = time.time()
-  paused_extra = 0.0
-  if st.session_state.test_paused and st.session_state.paused_at is not None:
-    paused_extra = max(0.0, now - st.session_state.paused_at)
-  return max(
-      0.0,
-      (now - st.session_state.get("start_time", now))
-      - st.session_state.get("total_paused_sec", 0.0)
-      - paused_extra,
+  if not st.session_state.test_active:
+    st.session_state.last_active_ts = now
+    return st.session_state.remaining_sec
+
+  if st.session_state.test_paused:
+    st.session_state.last_active_ts = now
+    return max(0.0, st.session_state.remaining_sec)
+
+  dt = max(0.0, now - st.session_state.last_active_ts)
+  st.session_state.last_active_ts = now
+
+  # Cap single rerun delta to prevent huge jumps after network hiccup
+  if count_elapsed and dt > 0:
+    idx = st.session_state.q_index
+    st.session_state.q_times[idx] = st.session_state.q_times.get(idx, 0.0) + dt
+    st.session_state.remaining_sec = max(
+        0.0, st.session_state.remaining_sec - dt
+    )
+
+  return st.session_state.remaining_sec
+
+
+def persist_current_attempt(force_paused=None):
+  if not st.session_state.test_active or not st.session_state.current_test:
+    return
+  rem = sync_timer_and_question_clock(count_elapsed=True)
+  paused_state = (
+      st.session_state.test_paused if force_paused is None else force_paused
+  )
+  akey = make_attempt_key(st.session_state.username, st.session_state.current_test)
+  save_active_attempt_to_sheet(
+      spreadsheet,
+      {
+          "attempt_key": akey,
+          "username": st.session_state.username,
+          "test_id": st.session_state.current_test.get("test_id", ""),
+          "test_name": st.session_state.current_test["test_name"],
+          "remaining_sec": rem,
+          "total_duration_sec": st.session_state.test_duration_sec,
+          "is_paused": paused_state,
+          "q_index": st.session_state.q_index,
+          "user_answers": dict(st.session_state.user_answers),
+          "q_times": dict(st.session_state.q_times),
+      },
   )
 
 
-def record_current_q_time():
-  if st.session_state.test_active and not st.session_state.test_paused:
-    now = time.time()
-    spent = max(0.0, now - st.session_state.q_last_tick)
-    idx = st.session_state.q_index
-    st.session_state.q_times[idx] = st.session_state.q_times.get(idx, 0.0) + spent
-    st.session_state.q_last_tick = now
+def start_or_resume_test(test_obj, saved_attempt=None, duration_mins=10):
+  now = time.time()
+  st.session_state.current_test = test_obj
+  st.session_state.test_active = True
+  st.session_state.latest_result = None
+  st.session_state.last_active_ts = now
 
-
-def pause_test_timer():
-  if st.session_state.test_active and not st.session_state.test_paused:
-    record_current_q_time()
-    st.session_state.test_paused = True
-    st.session_state.paused_at = time.time()
-
-
-def resume_test_timer():
-  if st.session_state.test_active and st.session_state.test_paused:
-    now = time.time()
-    if st.session_state.paused_at is not None:
-      st.session_state.total_paused_sec = st.session_state.get(
-          "total_paused_sec", 0.0
-      ) + max(0.0, now - st.session_state.paused_at)
-    st.session_state.paused_at = None
+  if saved_attempt:
+    st.session_state.remaining_sec = max(
+        1.0, float(saved_attempt.get("remaining_sec", duration_mins * 60))
+    )
+    st.session_state.test_duration_sec = max(
+        st.session_state.remaining_sec,
+        float(saved_attempt.get("total_duration_sec", duration_mins * 60)),
+    )
+    st.session_state.test_paused = bool(saved_attempt.get("is_paused", False))
+    st.session_state.q_index = min(
+        max(0, int(saved_attempt.get("q_index", 0))),
+        max(0, len(test_obj["questions"]) - 1),
+    )
+    st.session_state.user_answers = dict(saved_attempt.get("user_answers", {}))
+    st.session_state.q_times = dict(saved_attempt.get("q_times", {}))
+  else:
+    dur = float(duration_mins * 60)
+    st.session_state.remaining_sec = dur
+    st.session_state.test_duration_sec = dur
     st.session_state.test_paused = False
-    st.session_state.q_last_tick = now
+    st.session_state.q_index = 0
+    st.session_state.user_answers = {}
+    st.session_state.q_times = {}
+    persist_current_attempt(force_paused=False)
 
 
+# ================= QUESTION PARSING & DOUBT HELPERS =================
 def normalize_questions_df(df):
   col_map = {c.strip().lower(): c for c in df.columns}
   q_col = col_map.get("question") or col_map.get("q")
@@ -713,7 +904,6 @@ def render_test_analysis(result_obj, scope_prefix="res"):
           unsafe_allow_html=True,
       )
 
-  # Full Answer Key Summary Table
   st.markdown("### Complete Answer Key Sheet")
   key_rows = []
   for idx, d in enumerate(result_obj["details"]):
@@ -785,12 +975,16 @@ def render_test_analysis(result_obj, scope_prefix="res"):
 
 
 def submit_test(test):
-  record_current_q_time()
-  total_elapsed = get_active_elapsed()
+  sync_timer_and_question_clock(count_elapsed=True)
+  total_elapsed = max(
+      0.0, float(st.session_state.test_duration_sec) - float(st.session_state.remaining_sec)
+  )
+  akey = make_attempt_key(st.session_state.username, test)
+  delete_active_attempt_from_sheet(spreadsheet, akey)
+
   st.session_state.test_active = False
   st.session_state.test_paused = False
-  st.session_state.paused_at = None
-  st.session_state.total_paused_sec = 0.0
+  st.session_state.remaining_sec = 0.0
 
   score = 0
   detailed = []
@@ -843,7 +1037,7 @@ def auth_screen():
       """
       <div class="hero-card" style="text-align:center; max-width:680px; margin: 24px auto;">
           <h2 style="margin:0; color:#38bdf8;">Practice Test & Analysis Portal</h2>
-          <p style="color:#94a3b8; margin-top:6px;">Google Sheets connected: permanent tests, progress tracking aur doubt help</p>
+          <p style="color:#94a3b8; margin-top:6px;">Google Sheets connected: auto-save progress, resume/re-attempt aur answer key</p>
       </div>
       """,
       unsafe_allow_html=True,
@@ -857,7 +1051,7 @@ def auth_screen():
       l_user = st.text_input("Username", key="l_user").strip()
       l_pass = st.text_input("Password", type="password", key="l_pass").strip()
       if st.button("Login", use_container_width=True):
-        users = load_users_from_sheet(spreadsheet)
+        users = load_users_from_sheet(spreadsheet, force=True)
         if l_user in users and users[l_user]["password"] == l_pass:
           sid = uuid.uuid4().hex[:16]
           save_session_to_sheet(spreadsheet, sid, l_user)
@@ -875,7 +1069,7 @@ def auth_screen():
       s_user = st.text_input("Choose Username", key="s_user").strip()
       s_pass = st.text_input("Choose Password", type="password", key="s_pass").strip()
       if st.button("Register Account", use_container_width=True):
-        users = load_users_from_sheet(spreadsheet)
+        users = load_users_from_sheet(spreadsheet, force=True)
         if s_user in users:
           st.warning("Ye username pehle se hai!")
         elif s_user and s_pass:
@@ -890,6 +1084,36 @@ if not st.session_state.logged_in:
   auth_screen()
 else:
   is_admin = st.session_state.role == "admin"
+
+  # Ensure URL keeps session token across refreshes
+  if st.session_state.session_token and st.query_params.get("sid") != st.session_state.session_token:
+    st.query_params["sid"] = st.session_state.session_token
+
+  saved_tests = load_tests_from_sheet(spreadsheet)
+  saved_results = load_results_from_sheet(spreadsheet)
+  active_attempts = load_active_attempts_from_sheet(spreadsheet)
+
+  # Restore active test after browser refresh / app reopen if not already in memory
+  if not st.session_state.test_active and st.session_state.latest_result is None:
+    user_unfinished = [
+        att
+        for att in active_attempts.values()
+        if att.get("username") == st.session_state.username
+    ]
+    if user_unfinished and st.session_state.get("_auto_restored_once") != st.session_state.username:
+      latest_att = user_unfinished[-1]
+      matched_test = next(
+          (
+              t
+              for t in saved_tests
+              if t.get("test_id") == latest_att.get("test_id")
+              or t.get("test_name") == latest_att.get("test_name")
+          ),
+          None,
+      )
+      if matched_test:
+        st.session_state["_auto_restored_once"] = st.session_state.username
+        start_or_resume_test(matched_test, saved_attempt=latest_att)
 
   st.sidebar.markdown(
       f"""
@@ -909,6 +1133,12 @@ else:
       placeholder="Optional - Ask Gemini ke liye",
   )
 
+  if st.sidebar.button("Sync Latest Sheet Data", use_container_width=True):
+    load_tests_from_sheet(spreadsheet, force=True)
+    load_results_from_sheet(spreadsheet, force=True)
+    load_active_attempts_from_sheet(spreadsheet, force=True)
+    st.rerun()
+
   menu = [
       "Take Test & Analysis",
       "Progress & Past Tests",
@@ -920,9 +1150,13 @@ else:
   choice = st.sidebar.radio("Navigation", menu)
 
   if st.sidebar.button("Logout", use_container_width=True):
+    # Save in-progress attempt before logging out so user can resume later
+    if st.session_state.test_active and st.session_state.current_test:
+      persist_current_attempt(force_paused=True)
     sid = st.session_state.get("session_token") or st.query_params.get("sid")
     delete_session_from_sheet(spreadsheet, sid)
     st.query_params.clear()
+    st.session_state["_auto_restored_once"] = ""
     st.session_state.session_token = ""
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -932,8 +1166,11 @@ else:
     st.session_state.latest_result = None
     st.rerun()
 
-  saved_tests = load_tests_from_sheet(spreadsheet)
-  saved_results = load_results_from_sheet(spreadsheet)
+  submitted_test_names = {
+      r["test_name"]
+      for r in saved_results
+      if r["username"] == st.session_state.username
+  }
 
   # ---------------- 1. TAKE TEST & INSTANT ANALYSIS ----------------
   if choice == "Take Test & Analysis":
@@ -951,7 +1188,7 @@ else:
           """
           <div class="hero-card">
               <h2 style="margin:0; color:#38bdf8;">Available Practice Tests</h2>
-              <p style="color:#94a3b8; margin:4px 0 0 0;">Sabhi tests Google Sheet me permanently saved hain. Timer set karein aur start karein.</p>
+              <p style="color:#94a3b8; margin:4px 0 0 0;">Refresh ya app close hone par bhi progress save rehti hai. Resume ya Re-attempt kabhi bhi karein.</p>
           </div>
           """,
           unsafe_allow_html=True,
@@ -964,18 +1201,28 @@ else:
         )
       else:
         for idx, t in enumerate(saved_tests):
+          akey = make_attempt_key(st.session_state.username, t)
+          saved_att = active_attempts.get(akey)
+          already_done = t["test_name"] in submitted_test_names
+
+          status_badge = ""
+          if saved_att:
+            status_badge = f" | Status: <b>Saved ({format_duration(saved_att['remaining_sec'])} left)</b>"
+          elif already_done:
+            status_badge = " | Status: <b>Completed</b>"
+
           st.markdown(
               f"""
               <div class="q-card">
                   <div style="font-size:18px; font-weight:700; color:#f8fafc;">Test #{idx+1}: {html.escape(str(t['test_name']))}</div>
                   <div style="font-size:13px; color:#94a3b8; margin-top:4px;">
-                      ID: <b>{html.escape(str(t.get('test_id', '')))}</b> | Created By: <b>{html.escape(str(t['creator']))}</b> | Questions: <b>{len(t['questions'])}</b> | Saved: <b>{html.escape(str(t.get('created_at', '')))}</b>
+                      ID: <b>{html.escape(str(t.get('test_id', '')))}</b> | Questions: <b>{len(t['questions'])}</b> | Saved: <b>{html.escape(str(t.get('created_at', '')))}</b>{status_badge}
                   </div>
               </div>
               """,
               unsafe_allow_html=True,
           )
-          col_t, col_b = st.columns([1, 2])
+          col_t, col_b1, col_b2 = st.columns([1.1, 1.2, 1.2])
           with col_t:
             t_mins = st.number_input(
                 "Timer (Minutes)",
@@ -983,24 +1230,41 @@ else:
                 value=max(5, len(t["questions"])),
                 key=f"time_{idx}",
             )
-          with col_b:
+          with col_b1:
             st.write("")
             st.write("")
-            if st.button(f"Start Test #{idx+1}", key=f"start_{idx}"):
-              now = time.time()
-              st.session_state.current_test = t
-              st.session_state.test_active = True
-              st.session_state.test_paused = False
-              st.session_state.paused_at = None
-              st.session_state.total_paused_sec = 0.0
-              st.session_state.test_duration = t_mins * 60
-              st.session_state.start_time = now
-              st.session_state.q_last_tick = now
-              st.session_state.q_index = 0
-              st.session_state.q_times = {}
-              st.session_state.user_answers = {}
-              st.session_state.latest_result = None
-              st.rerun()
+            if saved_att:
+              if st.button(
+                  f"Resume Test #{idx+1}",
+                  key=f"resume_{idx}",
+                  use_container_width=True,
+              ):
+                start_or_resume_test(t, saved_attempt=saved_att, duration_mins=t_mins)
+                st.rerun()
+            else:
+              btn_lbl = (
+                  f"Re-attempt #{idx+1}"
+                  if already_done
+                  else f"Start Test #{idx+1}"
+              )
+              if st.button(
+                  btn_lbl, key=f"start_{idx}", use_container_width=True
+              ):
+                start_or_resume_test(t, saved_attempt=None, duration_mins=t_mins)
+                st.rerun()
+
+          with col_b2:
+            st.write("")
+            st.write("")
+            if saved_att:
+              if st.button(
+                  f"Fresh Start #{idx+1}",
+                  key=f"fresh_{idx}",
+                  use_container_width=True,
+              ):
+                delete_active_attempt_from_sheet(spreadsheet, akey)
+                start_or_resume_test(t, saved_attempt=None, duration_mins=t_mins)
+                st.rerun()
 
           if is_admin:
             with st.expander(f"Admin: Rename / Delete '{t['test_name']}'"):
@@ -1041,8 +1305,8 @@ else:
       questions = test["questions"]
       total_q = len(questions)
 
-      elapsed = get_active_elapsed()
-      remaining = int(st.session_state.test_duration - elapsed)
+      rem_float = sync_timer_and_question_clock(count_elapsed=True)
+      remaining = int(round(rem_float))
 
       if remaining <= 0 and not st.session_state.test_paused:
         submit_test(test)
@@ -1056,11 +1320,17 @@ else:
           st.write("")
           if st.session_state.test_paused:
             if st.button("Resume Test", use_container_width=True):
-              resume_test_timer()
+              st.session_state.test_paused = False
+              st.session_state.last_active_ts = time.time()
+              persist_current_attempt(force_paused=False)
               st.rerun()
           else:
             if st.button("Pause Test", use_container_width=True):
-              pause_test_timer()
+              # Freeze exact remaining_sec immediately on pause
+              sync_timer_and_question_clock(count_elapsed=True)
+              st.session_state.test_paused = True
+              st.session_state.last_active_ts = time.time()
+              persist_current_attempt(force_paused=True)
               st.rerun()
         with top_r:
           if st.session_state.test_paused:
@@ -1076,8 +1346,8 @@ else:
 
         if st.session_state.test_paused:
           st.info(
-              "Test abhi **PAUSED** hai — timer ruka hua hai. Aage badhne ke"
-              " liye **Resume Test** dabayein."
+              "Test **PAUSED** hai — aapka time bilkul wahin ruka hua hai."
+              " Dobara shuru karne ke liye **Resume Test** dabayein."
           )
         else:
           st.caption("Question Palette:")
@@ -1086,15 +1356,14 @@ else:
             with pal_cols[p_i % len(pal_cols)]:
               mark = "*" if p_i in st.session_state.user_answers else ""
               if st.button(f"{p_i+1}{mark}", key=f"pal_{p_i}"):
-                record_current_q_time()
+                sync_timer_and_question_clock(count_elapsed=True)
                 st.session_state.q_index = p_i
+                persist_current_attempt()
                 st.rerun()
 
           cur_i = st.session_state.q_index
           q = questions[cur_i]
-          cur_spent = st.session_state.q_times.get(cur_i, 0.0) + max(
-              0.0, time.time() - st.session_state.q_last_tick
-          )
+          cur_spent = st.session_state.q_times.get(cur_i, 0.0)
 
           saved_letter = st.session_state.user_answers.get(cur_i)
           letters = ["A", "B", "C", "D"]
@@ -1124,19 +1393,24 @@ else:
           if choice_opt is not None:
             opt_idx = q["options"].index(choice_opt)
             if opt_idx < len(letters):
-              st.session_state.user_answers[cur_i] = letters[opt_idx]
+              new_ans = letters[opt_idx]
+              if st.session_state.user_answers.get(cur_i) != new_ans:
+                st.session_state.user_answers[cur_i] = new_ans
+                persist_current_attempt()
 
           nav1, nav2, nav3, nav4 = st.columns(4)
           with nav1:
             if st.button(
                 "Previous", disabled=(cur_i == 0), use_container_width=True
             ):
-              record_current_q_time()
+              sync_timer_and_question_clock(count_elapsed=True)
               st.session_state.q_index = max(0, cur_i - 1)
+              persist_current_attempt()
               st.rerun()
           with nav2:
             if st.button("Clear Selection", use_container_width=True):
               st.session_state.user_answers.pop(cur_i, None)
+              persist_current_attempt()
               st.rerun()
           with nav3:
             if st.button(
@@ -1144,8 +1418,9 @@ else:
                 disabled=(cur_i >= total_q - 1),
                 use_container_width=True,
             ):
-              record_current_q_time()
+              sync_timer_and_question_clock(count_elapsed=True)
               st.session_state.q_index = min(total_q - 1, cur_i + 1)
+              persist_current_attempt()
               st.rerun()
           with nav4:
             if st.button(
