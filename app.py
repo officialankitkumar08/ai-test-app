@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from datetime import datetime
 import pandas as pd
@@ -31,6 +32,33 @@ if "mock_tests" not in st.session_state:
   st.session_state.mock_tests = []
 if "mock_results" not in st.session_state:
   st.session_state.mock_results = []
+
+
+def parse_plain_questions(text):
+  blocks = re.split(r"\n\s*\n+", text.strip())
+  questions = []
+  for block in blocks:
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    if len(lines) < 5:
+      continue
+    q_line = re.sub(r"^(Q\s*\d*[\.\:\)]\s*)", "", lines[0], flags=re.IGNORECASE).strip()
+    opts = []
+    ans = "A"
+    for ln in lines[1:]:
+      m_ans = re.match(r"^(?:Answer|Ans|Correct)\s*[:\-]\s*([A-Da-d])", ln, flags=re.IGNORECASE)
+      if m_ans:
+        ans = m_ans.group(1).upper()
+        continue
+      m_opt = re.match(r"^([A-Da-d])[\)\.\:\-]\s*(.+)$", ln)
+      if m_opt:
+        opts.append(m_opt.group(2).strip())
+    if q_line and len(opts) >= 4:
+      questions.append({
+          "question": q_line,
+          "options": opts[:4],
+          "answer": ans,
+      })
+  return questions
 
 
 def submit_test(test):
@@ -113,7 +141,11 @@ else:
       f"Welcome, {st.session_state.username} ({st.session_state.role.upper()})"
   )
 
-  menu = ["Take Test & Practice", "AI Test Generator"]
+  menu = [
+      "Take Test & Practice",
+      "Upload Questions (File / Text)",
+      "AI Test Generator",
+  ]
   if st.session_state.role == "admin":
     menu.append("Admin Dashboard (All Users)")
 
@@ -131,8 +163,8 @@ else:
       st.subheader("Available Tests")
       if not st.session_state.mock_tests:
         st.info(
-            "Abhi koi test available nahi hai. 'AI Test Generator' se naya test"
-            " banayein!"
+            "Abhi koi test available nahi hai. 'Upload Questions' ya 'AI Test"
+            " Generator' se test add karein!"
         )
       else:
         for idx, t in enumerate(st.session_state.mock_tests):
@@ -183,6 +215,92 @@ else:
       if st.button("Submit Test"):
         submit_test(test)
 
+  elif choice == "Upload Questions (File / Text)":
+    st.subheader("File ya Text se Questions Upload Karein")
+    test_title = st.text_input(
+        "Test ka Naam", "Station Master Arithmetic Set"
+    )
+
+    tab_excel, tab_text = st.tabs(["Excel / CSV Upload", "Text / TXT Paste"])
+
+    with tab_excel:
+      st.write(
+          "Columns rakhein: `Question`, `OptionA`, `OptionB`, `OptionC`,"
+          " `OptionD`, `Answer` (A/B/C/D)"
+      )
+      up_file = st.file_uploader(
+          "Excel (.xlsx) ya CSV (.csv) chunein", type=["xlsx", "csv"]
+      )
+      if up_file is not None:
+        df = (
+            pd.read_csv(up_file)
+            if up_file.name.endswith(".csv")
+            else pd.read_excel(up_file)
+        )
+        st.dataframe(df.head(), use_container_width=True)
+
+        if st.button("Excel se Test Publish Karein"):
+          questions = []
+          for _, row in df.iterrows():
+            q_text = str(row.get("Question", "")).strip()
+            if q_text and q_text.lower() != "nan":
+              questions.append({
+                  "question": q_text,
+                  "options": [
+                      str(row.get("OptionA", "")).strip(),
+                      str(row.get("OptionB", "")).strip(),
+                      str(row.get("OptionC", "")).strip(),
+                      str(row.get("OptionD", "")).strip(),
+                  ],
+                  "answer": str(row.get("Answer", "A")).strip().upper(),
+              })
+          if questions:
+            st.session_state.mock_tests.append({
+                "test_name": test_title,
+                "creator": st.session_state.username,
+                "prompt": f"Uploaded file: {up_file.name}",
+                "questions": questions,
+            })
+            st.success(f"{len(questions)} questions publish ho gaye!")
+          else:
+            st.error("Valid questions nahi mile. Column names check karein.")
+
+    with tab_text:
+      st.write(
+          "Har question block ke baad ek blank line rakhein, options A)/B)/C)/D)"
+          " me likhein, aur `Answer: A` likhein."
+      )
+      txt_upload = st.file_uploader("Ya .txt file upload karein", type=["txt"])
+      default_txt = ""
+      if txt_upload is not None:
+        default_txt = txt_upload.read().decode("utf-8", errors="ignore")
+
+      raw_text = st.text_area(
+          "Questions + Options + Answer paste karein:",
+          value=default_txt,
+          height=220,
+          placeholder=(
+              "Q1. 25% of 200 is?\nA) 25\nB) 50\nC) 75\nD) 100\nAnswer: B\n\n"
+              "Q2. 12 * 15 = ?\nA) 150\nB) 160\nC) 180\nD) 200\nAnswer: C"
+          ),
+      )
+
+      if st.button("Text se Test Publish Karein"):
+        parsed_qs = parse_plain_questions(raw_text)
+        if parsed_qs:
+          st.session_state.mock_tests.append({
+              "test_name": test_title,
+              "creator": st.session_state.username,
+              "prompt": "Uploaded/Pasted plain text",
+              "questions": parsed_qs,
+          })
+          st.success(f"{len(parsed_qs)} questions publish ho gaye!")
+        else:
+          st.error(
+              "Format match nahi hua. Har sawal me 4 options (A/B/C/D) aur"
+              " Answer: A/B/C/D rakhein."
+          )
+
   elif choice == "AI Test Generator":
     st.subheader("AI se Naya Test Banayein (Multi-AI Support)")
     st.info(
@@ -204,7 +322,7 @@ else:
     )
     prompt_text = st.text_area(
         "Prompt likhein:",
-        "Railway Station Master exam ke liye intermediate arithmetic ke 5 tough"
+        "Railway Station Master exam ke liye intermediate arithmetic ke 10"
         " questions options (A, B, C, D) ke sath do.",
     )
 
@@ -225,11 +343,25 @@ You must return ONLY a valid JSON array of objects. Do not include markdown ```j
 
             if ai_provider == "Google Gemini":
               client = genai.Client(api_key=api_key)
-              response = client.models.generate_content(
-                  model="gemini-3.8-flash",
-                  contents=structured_prompt,
-                  config={"max_output_tokens": 8192},
-              )
+              models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash"]
+              response = None
+              last_err = None
+              for m_name in models_to_try:
+                for _ in range(2):
+                  try:
+                    response = client.models.generate_content(
+                        model=m_name,
+                        contents=structured_prompt,
+                        config={"max_output_tokens": 8192},
+                    )
+                    break
+                  except Exception as ex:
+                    last_err = ex
+                    time.sleep(2)
+                if response:
+                  break
+              if not response:
+                raise last_err
               raw = (
                   response.text.replace("```json", "")
                   .replace("```", "")
@@ -255,7 +387,7 @@ You must return ONLY a valid JSON array of objects. Do not include markdown ```j
               client = anthropic.Anthropic(api_key=api_key)
               message = client.messages.create(
                   model="claude-3-5-sonnet-20241022",
-                  max_tokens=1000,
+                  max_tokens=2000,
                   messages=[{"role": "user", "content": structured_prompt}],
               )
               raw = (
